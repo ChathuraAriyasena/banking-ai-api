@@ -1,10 +1,11 @@
 """
 Core inference pipeline: ticket text -> model predictions -> KB retrieval -> LLM guidance.
 
-This is the notebook logic from LLM_Banking_Implementation.ipynb, converted from an
-interactive/Colab script into reusable functions with no input() calls, no
-drive.mount(), and no getpass(). Everything is loaded once at import time
-(module-level globals) instead of per-request, so the API stays fast.
+This version runs the model via ONNX Runtime instead of full PyTorch, which
+uses dramatically less memory at serve time -- needed to fit inside a free
+512MB hosting tier. The PyTorch -> ONNX conversion happens once, offline,
+in Colab (see colab_cell.py); this file only ever loads the already-converted
+model.onnx file.
 """
 
 import ast
@@ -14,44 +15,54 @@ import os
 import pickle
 from datetime import datetime
 
+import numpy as np
+import onnxruntime as ort
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from openai import OpenAI
 from transformers import AutoTokenizer
-
-from app.model import MultiTaskModel
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-# The 4 model artifacts are NOT stored in this code repo (they're too large
-# for a normal git push without LFS setup). Instead they live in a Hugging
-# Face model repo (separate from Spaces — this part of HF is still free and
-# has no compute restrictions), and this app downloads them once at startup
-# and caches them locally inside the container.
+# Artifacts live in a Hugging Face model repo (free, unrestricted storage,
+# separate from Spaces) and are downloaded once at startup.
 ARTIFACTS_DIR = os.environ.get("ARTIFACTS_DIR", "artifacts")
 HF_REPO_ID = os.environ.get("HF_REPO_ID")  # e.g. "yourusername/banking-ai-artifacts"
 HF_TOKEN = os.environ.get("HF_TOKEN")  # required if the HF repo above is Private
 
-CKPT_PATH = os.environ.get("CKPT_PATH", f"{ARTIFACTS_DIR}/multitask_distilbert_clean.pt")
+# Tokenizer is fetched fresh from Hugging Face (small, just vocab + config,
+# not the full model weights) -- same base tokenizer used in training.
+TOKENIZER_NAME = os.environ.get("TOKENIZER_NAME", "distilbert-base-uncased")
+
+ONNX_PATH = os.environ.get("ONNX_PATH", f"{ARTIFACTS_DIR}/model.onnx")
 ENCODER_PATH = os.environ.get("ENCODER_PATH", f"{ARTIFACTS_DIR}/label_encoders.pkl")
 KB_PATH = os.environ.get("KB_PATH", f"{ARTIFACTS_DIR}/kb_policies_rag.csv")
-KB_EMB_PATH = os.environ.get("KB_EMB_PATH", f"{ARTIFACTS_DIR}/kb_embeddings.pt")
+KB_EMB_PATH = os.environ.get("KB_EMB_PATH", f"{ARTIFACTS_DIR}/kb_embeddings.npy")
 
 ARTIFACT_FILENAMES = [
-    "multitask_distilbert_clean.pt",
+    "model.onnx",
     "label_encoders.pkl",
     "kb_policies_rag.csv",
-    "kb_embeddings.pt",
+    "kb_embeddings.npy",
 ]
+
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini-2025-08-07")
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.40"))
+
+TASKS = ["intent", "issue_type", "product", "urgency", "sentiment", "routing_queue"]
+# Must match the output order used in the ONNX export (colab_cell.py)
+ONNX_OUTPUT_NAMES = TASKS + ["pooled_embedding"]
+
+REQUIRED_KEYS = [
+    "interaction_id", "timestamp", "mode", "summary",
+    "actions", "clarifications", "risk_notes", "kb_policies_used",
+]
+ALLOWED_MODES = {"HIGH_CONFIDENCE", "REVIEW_REQUIRED"}
 
 
 def download_artifacts_if_needed():
     """Download the 4 artifact files from the Hugging Face model repo on first
-    startup, if they aren't already present locally. Safe to call every
-    startup — it skips files that already exist."""
+    startup, if they aren't already present locally."""
     os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
     all_present = all(
@@ -76,29 +87,15 @@ def download_artifacts_if_needed():
         if os.path.exists(local_path):
             continue
         downloaded_path = hf_hub_download(repo_id=HF_REPO_ID, filename=fname, token=HF_TOKEN)
-        # hf_hub_download caches elsewhere; copy/symlink it to our artifacts dir
         if not os.path.exists(local_path):
             os.symlink(downloaded_path, local_path)
         print(f"  - {fname} downloaded")
 
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini-2025-08-07")
-CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.40"))
-
-TASKS = ["intent", "issue_type", "product", "urgency", "sentiment", "routing_queue"]
-
-REQUIRED_KEYS = [
-    "interaction_id", "timestamp", "mode", "summary",
-    "actions", "clarifications", "risk_notes", "kb_policies_used",
-]
-ALLOWED_MODES = {"HIGH_CONFIDENCE", "REVIEW_REQUIRED"}
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---------------------------------------------------------------------------
-# Globals populated by load_artifacts() — called once at app startup.
+# Globals populated by load_artifacts() -- called once at app startup.
 # ---------------------------------------------------------------------------
-model = None
-backbone = None
+session = None
 tokenizer = None
 encoders = None
 kb_df = None
@@ -107,43 +104,17 @@ client = None
 
 
 def load_artifacts():
-    """Load model, encoders, KB, KB embeddings, and OpenAI client. Call once at startup."""
-    global model, backbone, tokenizer, encoders, kb_df, kb_embeddings_norm, client
+    """Load the ONNX model, tokenizer, encoders, KB, KB embeddings, and OpenAI client."""
+    global session, tokenizer, encoders, kb_df, kb_embeddings_norm, client
 
     download_artifacts_if_needed()
 
-    # mmap=True avoids reading the whole checkpoint file into RAM up front;
-    # tensors are paged in from disk as needed instead.
-    checkpoint = torch.load(CKPT_PATH, map_location=device, mmap=True)
-    model_name = checkpoint["model_name"]
-    num_labels_dict = checkpoint["num_labels_dict"]
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 1
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    session = ort.InferenceSession(ONNX_PATH, sess_options=so, providers=["CPUExecutionProvider"])
 
-    # pretrained_backbone=False: build the architecture from config only
-    # (no download of generic pretrained weights) since load_state_dict()
-    # below immediately overwrites every weight with our fine-tuned ones.
-    # This avoids briefly holding two full copies of the model in memory.
-    model = MultiTaskModel(model_name, num_labels_dict, pretrained_backbone=False).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-
-    # Free the checkpoint dict now that its tensors have been copied into
-    # the model — this is the single biggest memory saving at startup.
-    del checkpoint
-    gc.collect()
-
-    # Quantize: compress the model's weights from 32-bit floats down to
-    # 8-bit integers. Cuts memory use roughly 3-4x with only a very small
-    # accuracy trade-off — needed to fit inside a 512MB memory limit.
-    model = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
-    model.eval()
-    gc.collect()
-
-    backbone = model.backbone
-    backbone.eval()
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 
     with open(ENCODER_PATH, "rb") as f:
         encoders = pickle.load(f)
@@ -152,19 +123,19 @@ def load_artifacts():
     for col in ["product_tags", "issue_type_tags", "intent_tags"]:
         kb_df[col] = kb_df[col].apply(ast.literal_eval)
 
-    kb_embeddings = torch.load(KB_EMB_PATH, map_location=device, mmap=True)
-    kb_embeddings_norm = F.normalize(kb_embeddings, p=2, dim=1).clone()
+    kb_embeddings = np.load(KB_EMB_PATH)
+    norms = np.linalg.norm(kb_embeddings, axis=1, keepdims=True)
+    kb_embeddings_norm = kb_embeddings / np.clip(norms, 1e-8, None)
     del kb_embeddings
     gc.collect()
 
-    # Requires OPENAI_API_KEY to already be set as an env var / platform secret.
     client = OpenAI()
 
-    print("Artifacts loaded. Model:", model_name, "| KB rows:", len(kb_df))
+    print("Artifacts loaded. KB rows:", len(kb_df))
 
 
 # ---------------------------------------------------------------------------
-# Feature building — identical logic to build_input_text() in the ML notebook.
+# Feature building -- identical logic to build_input_text() in the ML notebook.
 # ---------------------------------------------------------------------------
 def build_input_text(channel, customer_segment, subject, timestamp, ticket_text):
     if timestamp:
@@ -202,21 +173,35 @@ def build_input_text(channel, customer_segment, subject, timestamp, ticket_text)
 
 
 # ---------------------------------------------------------------------------
-# Model inference
+# ONNX inference (replaces PyTorch forward pass)
 # ---------------------------------------------------------------------------
-@torch.no_grad()
-def run_model(input_text):
+def _softmax(x):
+    x = x - np.max(x, axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / np.sum(e, axis=-1, keepdims=True)
+
+
+def _run_onnx(input_text):
     enc = tokenizer(
-        input_text, padding=True, truncation=True, max_length=256, return_tensors="pt"
-    ).to(device)
-    outputs = model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"])
+        input_text, padding="max_length", truncation=True, max_length=256, return_tensors="np"
+    )
+    ort_inputs = {
+        "input_ids": enc["input_ids"].astype(np.int64),
+        "attention_mask": enc["attention_mask"].astype(np.int64),
+    }
+    outputs = session.run(ONNX_OUTPUT_NAMES, ort_inputs)
+    return dict(zip(ONNX_OUTPUT_NAMES, outputs))
+
+
+def run_model(input_text):
+    out = _run_onnx(input_text)
 
     pred_labels, pred_tags, confidences = {}, {}, {}
     for t in TASKS:
-        probs = torch.softmax(outputs[t], dim=-1)[0]
-        conf, idx = torch.max(probs, dim=0)
-        conf = float(conf.item())
-        label = encoders[t].inverse_transform([int(idx.item())])[0]
+        probs = _softmax(out[t][0])
+        idx = int(np.argmax(probs))
+        conf = float(probs[idx])
+        label = encoders[t].inverse_transform([idx])[0]
 
         pred_labels[t] = label
         confidences[t] = conf
@@ -225,26 +210,25 @@ def run_model(input_text):
     return pred_labels, pred_tags, confidences
 
 
+def embed_query(text, max_length=256):
+    out = _run_onnx(text)
+    emb = out["pooled_embedding"][0]
+    norm = np.linalg.norm(emb)
+    return emb / max(norm, 1e-8)
+
+
 # ---------------------------------------------------------------------------
 # KB retrieval + rerank
 # ---------------------------------------------------------------------------
-@torch.no_grad()
-def embed_query(text, max_length=256):
-    enc = tokenizer(
-        text, return_tensors="pt", padding=True, truncation=True, max_length=max_length
-    ).to(device)
-    out = backbone(**enc).last_hidden_state
-    emb = out[:, 0, :]
-    return F.normalize(emb, p=2, dim=1)
-
-
-@torch.no_grad()
 def retrieve_kb(query_text, top_k=5):
     query_emb = embed_query(query_text)
-    sims = torch.matmul(kb_embeddings_norm.to(device), query_emb[0])
-    top_vals, top_idx = torch.topk(sims, k=min(top_k, len(kb_df)))
-    hits = kb_df.iloc[top_idx.cpu().numpy()].copy()
-    hits["similarity"] = top_vals.cpu().numpy()
+    sims = kb_embeddings_norm @ query_emb
+    top_k = min(top_k, len(kb_df))
+    top_idx = np.argpartition(-sims, top_k - 1)[:top_k]
+    top_idx = top_idx[np.argsort(-sims[top_idx])]
+
+    hits = kb_df.iloc[top_idx].copy()
+    hits["similarity"] = sims[top_idx]
     return hits
 
 
@@ -265,7 +249,7 @@ def rerank_kb_hits(kb_hits, pred_labels):
 
 
 # ---------------------------------------------------------------------------
-# Prompt building — identical to build_agent_guidance_prompt() in the notebook.
+# Prompt building -- identical to build_agent_guidance_prompt() in the notebook.
 # ---------------------------------------------------------------------------
 def build_agent_guidance_prompt(input_text, pred_labels, pred_tags, confidences, kb_hits, max_kb=2):
     now = datetime.now()
@@ -372,7 +356,7 @@ def call_llm(prompt):
 
 
 # ---------------------------------------------------------------------------
-# End-to-end pipeline — this is what the API endpoint calls.
+# End-to-end pipeline -- this is what the API endpoint calls.
 # ---------------------------------------------------------------------------
 def run_pipeline(channel, customer_segment, subject, timestamp, ticket_text):
     input_text = build_input_text(channel, customer_segment, subject, timestamp, ticket_text)
