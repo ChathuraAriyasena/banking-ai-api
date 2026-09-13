@@ -41,6 +41,7 @@ KB_EMB_PATH = os.environ.get("KB_EMB_PATH", f"{ARTIFACTS_DIR}/kb_embeddings.npy"
 
 ARTIFACT_FILENAMES = [
     "model.onnx",
+    "model.onnx.data",
     "label_encoders.pkl",
     "kb_policies_rag.csv",
     "kb_embeddings.npy",
