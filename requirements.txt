@@ -1,0 +1,9 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+torch==2.3.1
+transformers==4.44.2
+pandas==2.2.2
+scikit-learn==1.5.1
+openai==1.51.0
+pydantic==2.9.2
+huggingface_hub==0.25.1
