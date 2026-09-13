@@ -6,13 +6,24 @@ state_dict will fail to load.
 """
 
 import torch.nn as nn
-from transformers import AutoModel
+from transformers import AutoConfig, AutoModel
 
 
 class MultiTaskModel(nn.Module):
-    def __init__(self, model_name, num_labels_dict, dropout=0.2):
+    def __init__(self, model_name, num_labels_dict, dropout=0.2, pretrained_backbone=True):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_name)
+        if pretrained_backbone:
+            # Used during TRAINING: start from real pretrained weights.
+            self.backbone = AutoModel.from_pretrained(model_name)
+        else:
+            # Used when SERVING a fine-tuned checkpoint: build the backbone
+            # from just the architecture config (randomly initialized,
+            # cheap, no extra download), since load_state_dict() immediately
+            # overwrites every weight anyway. This avoids downloading AND
+            # briefly holding two full copies of the model in memory at
+            # once — important on memory-constrained free hosting tiers.
+            config = AutoConfig.from_pretrained(model_name)
+            self.backbone = AutoModel.from_config(config)
         h = self.backbone.config.hidden_size
         self.dropout = nn.Dropout(dropout)
         self.intent_head        = nn.Linear(h, num_labels_dict["intent"])
