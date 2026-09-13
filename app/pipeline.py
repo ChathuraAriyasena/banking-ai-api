@@ -16,6 +16,7 @@ from datetime import datetime
 
 import pandas as pd
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from openai import OpenAI
 from transformers import AutoTokenizer
@@ -130,6 +131,13 @@ def load_artifacts():
     # Free the checkpoint dict now that its tensors have been copied into
     # the model — this is the single biggest memory saving at startup.
     del checkpoint
+    gc.collect()
+
+    # Quantize: compress the model's weights from 32-bit floats down to
+    # 8-bit integers. Cuts memory use roughly 3-4x with only a very small
+    # accuracy trade-off — needed to fit inside a 512MB memory limit.
+    model = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+    model.eval()
     gc.collect()
 
     backbone = model.backbone
