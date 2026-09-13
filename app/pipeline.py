@@ -8,6 +8,7 @@ drive.mount(), and no getpass(). Everything is loaded once at import time
 """
 
 import ast
+import gc
 import json
 import os
 import pickle
@@ -110,13 +111,26 @@ def load_artifacts():
 
     download_artifacts_if_needed()
 
-    checkpoint = torch.load(CKPT_PATH, map_location=device)
+    # mmap=True avoids reading the whole checkpoint file into RAM up front;
+    # tensors are paged in from disk as needed instead.
+    checkpoint = torch.load(CKPT_PATH, map_location=device, mmap=True)
     model_name = checkpoint["model_name"]
     num_labels_dict = checkpoint["num_labels_dict"]
 
-    model = MultiTaskModel(model_name, num_labels_dict).to(device)
+    # pretrained_backbone=False: build the architecture from config only
+    # (no download of generic pretrained weights) since load_state_dict()
+    # below immediately overwrites every weight with our fine-tuned ones.
+    # This avoids briefly holding two full copies of the model in memory.
+    model = MultiTaskModel(model_name, num_labels_dict, pretrained_backbone=False).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    # Free the checkpoint dict now that its tensors have been copied into
+    # the model — this is the single biggest memory saving at startup.
+    del checkpoint
+    gc.collect()
 
     backbone = model.backbone
     backbone.eval()
@@ -130,8 +144,10 @@ def load_artifacts():
     for col in ["product_tags", "issue_type_tags", "intent_tags"]:
         kb_df[col] = kb_df[col].apply(ast.literal_eval)
 
-    kb_embeddings = torch.load(KB_EMB_PATH)
-    kb_embeddings_norm = F.normalize(kb_embeddings, p=2, dim=1)
+    kb_embeddings = torch.load(KB_EMB_PATH, map_location=device, mmap=True)
+    kb_embeddings_norm = F.normalize(kb_embeddings, p=2, dim=1).clone()
+    del kb_embeddings
+    gc.collect()
 
     # Requires OPENAI_API_KEY to already be set as an env var / platform secret.
     client = OpenAI()
@@ -329,70 +345,3 @@ def validate_agent_json(raw_text):
     for key in ["actions", "clarifications", "risk_notes"]:
         val = data[key]
         if not isinstance(val, list) or any(not isinstance(x, str) for x in val):
-            return False, f"{key} must be a list of strings."
-
-    for i, item in enumerate(data["kb_policies_used"]):
-        if not isinstance(item, dict) or "kb_id" not in item or "title" not in item:
-            return False, f"kb_policies_used[{i}] must have 'kb_id' and 'title'."
-
-    return True, None
-
-
-def call_llm(prompt):
-    response = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=1,
-    )
-    return response.choices[0].message.content
-
-
-# ---------------------------------------------------------------------------
-# End-to-end pipeline — this is what the API endpoint calls.
-# ---------------------------------------------------------------------------
-def run_pipeline(channel, customer_segment, subject, timestamp, ticket_text):
-    input_text = build_input_text(channel, customer_segment, subject, timestamp, ticket_text)
-
-    pred_labels, pred_tags, confidences = run_model(input_text)
-
-    query_text = (
-        f"Intent: {pred_labels['intent']}\n"
-        f"Issue type: {pred_labels['issue_type']}\n"
-        f"Product: {pred_labels['product']}\n"
-        f"Urgency: {pred_labels['urgency']}\n"
-        f"Sentiment: {pred_labels['sentiment']}\n"
-        f"Routing queue: {pred_labels['routing_queue']}\n\n"
-        f"Ticket:\n{input_text}"
-    )
-
-    kb_hits_raw = retrieve_kb(query_text, top_k=5)
-    kb_hits = rerank_kb_hits(kb_hits_raw, pred_labels).head(3)
-
-    kb_hits_out = kb_hits[["kb_id", "title", "routing_queue", "similarity", "final_score"]].to_dict(orient="records")
-
-    prompt, interaction_id, timestamp_str, mode = build_agent_guidance_prompt(
-        input_text, pred_labels, pred_tags, confidences, kb_hits, max_kb=2
-    )
-
-    raw_llm_output = call_llm(prompt)
-    is_valid, validation_error = validate_agent_json(raw_llm_output)
-
-    try:
-        agent_guidance = json.loads(raw_llm_output)
-    except json.JSONDecodeError:
-        agent_guidance = None
-
-    return {
-        "input_text": input_text,
-        "model_predictions": {
-            t: {"label": pred_labels[t], "confidence": round(confidences[t], 4), "tag": pred_tags[t]}
-            for t in TASKS
-        },
-        "kb_hits": kb_hits_out,
-        "llm_response": agent_guidance,
-        "llm_raw_output": raw_llm_output if agent_guidance is None else None,
-        "validation": {"is_valid": is_valid, "error": validation_error},
-        "interaction_id": interaction_id,
-        "timestamp": timestamp_str,
-        "mode": mode,
-    }
