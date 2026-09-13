@@ -31,6 +31,7 @@ from app.model import MultiTaskModel
 # and caches them locally inside the container.
 ARTIFACTS_DIR = os.environ.get("ARTIFACTS_DIR", "artifacts")
 HF_REPO_ID = os.environ.get("HF_REPO_ID")  # e.g. "yourusername/banking-ai-artifacts"
+HF_TOKEN = os.environ.get("HF_TOKEN")  # required if the HF repo above is Private
 
 CKPT_PATH = os.environ.get("CKPT_PATH", f"{ARTIFACTS_DIR}/multitask_distilbert_clean.pt")
 ENCODER_PATH = os.environ.get("ENCODER_PATH", f"{ARTIFACTS_DIR}/label_encoders.pkl")
@@ -72,7 +73,7 @@ def download_artifacts_if_needed():
         local_path = os.path.join(ARTIFACTS_DIR, fname)
         if os.path.exists(local_path):
             continue
-        downloaded_path = hf_hub_download(repo_id=HF_REPO_ID, filename=fname)
+        downloaded_path = hf_hub_download(repo_id=HF_REPO_ID, filename=fname, token=HF_TOKEN)
         # hf_hub_download caches elsewhere; copy/symlink it to our artifacts dir
         if not os.path.exists(local_path):
             os.symlink(downloaded_path, local_path)
