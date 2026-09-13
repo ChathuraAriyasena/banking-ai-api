@@ -5,12 +5,20 @@ POST /predict  -> runs the full pipeline: model predictions + KB retrieval + LLM
 GET  /health   -> simple readiness check
 """
 
-from fastapi import FastAPI, HTTPException
+import os
+
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app import pipeline
 
 app = FastAPI(title="Banking AI Copilot API", version="1.0")
+
+# Secret value that must be sent in the x-api-key header on every /predict
+# call. Set this in Render's Environment Variables. If it's not set at all,
+# the check is skipped (useful for local testing) -- but always set it in
+# production so the endpoint isn't wide open.
+API_KEY = os.environ.get("API_KEY")
 
 
 class TicketRequest(BaseModel):
@@ -28,11 +36,14 @@ def startup_event():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": pipeline.model is not None}
+    return {"status": "ok", "model_loaded": pipeline.session is not None}
 
 
 @app.post("/predict")
-def predict(req: TicketRequest):
+def predict(req: TicketRequest, x_api_key: str | None = Header(default=None)):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Missing or invalid API key")
+
     if not req.ticket_text.strip():
         raise HTTPException(status_code=400, detail="ticket_text must not be empty")
 
