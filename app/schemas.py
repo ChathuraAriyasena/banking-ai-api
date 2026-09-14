@@ -1,0 +1,172 @@
+"""
+Formal request and response schemas.
+
+FastAPI checks every INCOMING request against TicketRequest automatically,
+and (because we attach response_model=PredictResponse on the endpoint) it
+now also checks every OUTGOING response against PredictResponse -- so a
+bug that accidentally returns the wrong shape gets caught as a clear
+server error instead of silently sending malformed JSON to the caller.
+
+Field order here is also the field order in the actual JSON response.
+"""
+
+from typing import List, Literal, Optional
+
+import pandas as pd
+from pydantic import BaseModel, Field, field_validator
+
+
+# ---------------------------------------------------------------------------
+# Request
+# ---------------------------------------------------------------------------
+
+# Confirmed directly from the training notebook's VALID_CHANNELS cleaning
+# rule -- any request with a channel outside this exact list is rejected,
+# since the model was never trained on anything else.
+ChannelType = Literal[
+    "mobile_banking",
+    "internet_banking",
+    "chatbot",
+    "call_center",
+    "branch",
+    "email",
+    "whatsapp",
+]
+
+
+class TicketRequest(BaseModel):
+    ticket_text: str = Field(..., min_length=1, max_length=4000, description="The raw customer support ticket text")
+    channel: ChannelType = Field("mobile_banking", description="Must be one of the channels the model was trained on")
+    # No confirmed fixed list of customer_segment values was found in the
+    # training notebooks (only example values like "corporate" and
+    # "retail_first" appeared in sample output), so this is validated as a
+    # well-formed segment CODE (lowercase, underscore-separated) rather than
+    # a strict enum. Tell me the full valid list if you want this locked
+    # down the same way channel is.
+    customer_segment: str = Field(
+        "retail_plus",
+        min_length=2,
+        max_length=50,
+        pattern=r"^[a-z][a-z0-9_]*$",
+        description="Lowercase, underscore-separated segment code, e.g. retail_plus, corporate",
+    )
+    subject: Optional[str] = Field(None, max_length=200)
+    timestamp: Optional[str] = Field(None, description="Format: YYYY-MM-DD HH:MM:SS. Leave blank to default to now.")
+
+    @field_validator("ticket_text")
+    @classmethod
+    def ticket_text_not_blank(cls, v):
+        if not v.strip():
+            raise ValueError("ticket_text must not be blank or whitespace-only")
+        return v
+
+    @field_validator("timestamp")
+    @classmethod
+    def timestamp_must_be_valid(cls, v):
+        # Empty/not provided is fine -- that means "use now", handled downstream.
+        # A non-empty but unparseable value is rejected outright, rather than
+        # silently substituted with the current time.
+        if v is None or v == "":
+            return v
+        parsed = pd.to_datetime(v, errors="coerce")
+        if pd.isna(parsed):
+            raise ValueError("timestamp could not be parsed. Expected format: YYYY-MM-DD HH:MM:SS")
+        return v
+
+    timestamp: Optional[str] = Field(None, description="YYYY-MM-DD HH:MM:SS, defaults to now")
+
+
+# ---------------------------------------------------------------------------
+# Response building blocks
+# ---------------------------------------------------------------------------
+class TicketContext(BaseModel):
+    """The ticket and its surrounding context, as clean structured fields
+    (not a single string with tags jammed into it)."""
+    channel: str
+    customer_segment: str
+    subject: Optional[str] = None
+    day_of_week: str
+    time_bucket: str
+    business_hours: bool
+    weekend: bool
+    ticket_text: str
+
+
+class ModelPrediction(BaseModel):
+    label: str
+    confidence: float
+    tag: str
+
+
+class ModelPredictions(BaseModel):
+    """All 6 required. If the model ever failed to produce one of these,
+    this now fails loudly instead of silently returning a partial result."""
+    intent: ModelPrediction
+    issue_type: ModelPrediction
+    product: ModelPrediction
+    urgency: ModelPrediction
+    sentiment: ModelPrediction
+    routing_queue: ModelPrediction
+
+
+class KBHit(BaseModel):
+    kb_id: str
+    title: str
+    routing_queue: str
+    similarity: float
+    final_score: float
+
+
+class KBPolicyRef(BaseModel):
+    kb_id: str
+    title: str
+
+
+class LLMGuidance(BaseModel):
+    """Your existing LLM output schema, reused here as the shape of
+    llm_response specifically -- not the shape of the whole API response."""
+    interaction_id: str
+    timestamp: str
+    mode: str
+    summary: str
+    actions: List[str]
+    clarifications: List[str]
+    risk_notes: List[str]
+    kb_policies_used: List[KBPolicyRef]
+
+
+class ValidationResult(BaseModel):
+    is_valid: bool
+    error: Optional[str] = None
+
+
+class ResponseMeta(BaseModel):
+    """Operational/traceability metadata about THIS specific call -- separate
+    from the business data above, so the two don't get mixed together."""
+    correlation_id: str = Field(..., description="Echoes the caller's x-correlation-id, or a generated one if not sent")
+    client_id: Optional[str] = Field(None, description="From the x-client-id header, if the caller sent one")
+    environment: str
+    api_version: str
+    model_version: str
+    kb_version: str
+    llm_model: str
+    request_received_at: str
+    processing_time_ms: float
+
+
+# ---------------------------------------------------------------------------
+# Full response
+# ---------------------------------------------------------------------------
+class PredictResponse(BaseModel):
+    interaction_id: str
+    timestamp: str
+    mode: str
+    ticket_context: TicketContext
+    model_predictions: ModelPredictions
+    kb_hits: List[KBHit]
+    # Optional: the one field allowed to be missing, since a rare malformed
+    # LLM reply should not fail the whole response -- see llm_raw_output below.
+    llm_response: Optional[LLMGuidance] = None
+    llm_raw_output: Optional[str] = None
+    validation: ValidationResult
+    meta: ResponseMeta
