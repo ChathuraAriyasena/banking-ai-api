@@ -21,8 +21,9 @@ from pydantic import BaseModel, Field, field_validator
 # ---------------------------------------------------------------------------
 
 # Confirmed directly from the training notebook's VALID_CHANNELS cleaning
-# rule -- any request with a channel outside this exact list is rejected,
-# since the model was never trained on anything else.
+# rule -- this is the exact set the model was trained on. The raw dataset
+# also contained sms, telegram, and unknown_channel, but those were filtered
+# out before training, so they're deliberately excluded here too.
 ChannelType = Literal[
     "mobile_banking",
     "internet_banking",
@@ -33,23 +34,22 @@ ChannelType = Literal[
     "whatsapp",
 ]
 
+# Confirmed by the user as the full valid customer_segment list.
+CustomerSegmentType = Literal[
+    "corporate",
+    "retail",
+    "retail_plus",
+    "retail_first",
+    "unknown",
+    "vip",
+    "sme",
+]
+
 
 class TicketRequest(BaseModel):
     ticket_text: str = Field(..., min_length=1, max_length=4000, description="The raw customer support ticket text")
-    channel: ChannelType = Field("mobile_banking", description="Must be one of the channels the model was trained on")
-    # No confirmed fixed list of customer_segment values was found in the
-    # training notebooks (only example values like "corporate" and
-    # "retail_first" appeared in sample output), so this is validated as a
-    # well-formed segment CODE (lowercase, underscore-separated) rather than
-    # a strict enum. Tell me the full valid list if you want this locked
-    # down the same way channel is.
-    customer_segment: str = Field(
-        "retail_plus",
-        min_length=2,
-        max_length=50,
-        pattern=r"^[a-z][a-z0-9_]*$",
-        description="Lowercase, underscore-separated segment code, e.g. retail_plus, corporate",
-    )
+    channel: ChannelType = Field("mobile_banking", description="Must be one of the known channel values")
+    customer_segment: CustomerSegmentType = Field("retail_plus", description="Must be one of the known customer segment values")
     subject: Optional[str] = Field(None, max_length=200)
     timestamp: Optional[str] = Field(None, description="Format: YYYY-MM-DD HH:MM:SS. Leave blank to default to now.")
 
