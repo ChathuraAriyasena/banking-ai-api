@@ -64,8 +64,7 @@ TASKS = ["intent", "issue_type", "product", "urgency", "sentiment", "routing_que
 ONNX_OUTPUT_NAMES = TASKS + ["pooled_embedding"]
 
 REQUIRED_KEYS = [
-    "interaction_id", "timestamp", "mode", "summary",
-    "actions", "clarifications", "risk_notes", "kb_policies_used",
+    "summary", "actions", "clarifications", "risk_notes", "kb_policies_used",
 ]
 ALLOWED_MODES = {"HIGH_CONFIDENCE", "REVIEW_REQUIRED"}
 
@@ -335,11 +334,9 @@ def build_agent_guidance_prompt(input_text, pred_labels, pred_tags, confidences,
 
     lines.append("=== OUTPUT SCHEMA ===")
     lines.append(
-        "Return ONLY a JSON object of this exact form (no extra text):\n"
+        "Return ONLY a JSON object of this exact form (no extra text). Do NOT include "
+        "interaction_id, timestamp, or mode -- those are already handled outside this JSON:\n"
         "{\n"
-        '  "interaction_id": "string - copy INTERACTION_ID exactly",\n'
-        '  "timestamp": "string - copy CURRENT_DATETIME exactly",\n'
-        '  "mode": "HIGH_CONFIDENCE or REVIEW_REQUIRED",\n'
         '  "summary": "one-sentence internal summary of the case",\n'
         '  "actions": ["2 to 4 short action strings for the agent"],\n'
         '  "clarifications": ["0 to 4 short questions to ask the customer"],\n'
@@ -366,9 +363,6 @@ def validate_agent_json(raw_text):
     missing = [k for k in REQUIRED_KEYS if k not in data]
     if missing:
         return False, f"Missing required keys: {missing}"
-
-    if data["mode"] not in ALLOWED_MODES:
-        return False, f"mode must be one of {sorted(ALLOWED_MODES)}."
 
     for key in ["actions", "clarifications", "risk_notes"]:
         val = data[key]
