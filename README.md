@@ -1,7 +1,7 @@
 # Banking AI Copilot API
 
 FastAPI service wrapping a multi-task DistilBERT ticket classifier + KB retrieval (RAG) + LLM
-guidance generation, for banking support ticket triage. Served via ONNX Runtime (not raw PyTorch)
+agentic AI pipeline, for banking support ticket triage. Served via ONNX Runtime (not raw PyTorch)
 for lightweight, memory-efficient inference on free-tier cloud hosting. Requests and responses
 are both formally schema-enforced, not just loosely shaped JSON.
 
