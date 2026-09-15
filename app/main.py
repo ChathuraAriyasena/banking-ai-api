@@ -50,6 +50,10 @@ def predict(
 
     # If the caller didn't supply their own correlation ID, generate one --
     # every response always has one, either way, so nothing is ever untraceable.
+    # request_id is ALWAYS server-generated, fresh, per call -- never taken
+    # from a header, since its whole purpose is guaranteed uniqueness.
+    request_id = str(uuid.uuid4())
+
     correlation_id = x_correlation_id or str(uuid.uuid4())
 
     try:
@@ -66,6 +70,7 @@ def predict(
     processing_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
     result["meta"] = {
+        "request_id": request_id,
         "correlation_id": correlation_id,
         "client_id": x_client_id,
         "environment": pipeline.ENVIRONMENT,

@@ -141,7 +141,8 @@ class ValidationResult(BaseModel):
 class ResponseMeta(BaseModel):
     """Operational/traceability metadata about THIS specific call -- separate
     from the business data above, so the two don't get mixed together."""
-    correlation_id: str = Field(..., description="Echoes the caller's x-correlation-id, or a generated one if not sent")
+    request_id: str = Field(..., description="A fresh GUID generated for this exact call, always server-generated, never repeated")
+    correlation_id: str = Field(..., description="Echoes the caller's x-correlation-id, or a generated one if not sent -- can be shared across a chain of related calls")
     client_id: Optional[str] = Field(None, description="From the x-client-id header, if the caller sent one")
     environment: str
     api_version: str
